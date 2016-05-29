@@ -1,4 +1,5 @@
 from multiprocessing import Pool
+from multiprocessing.pool import ThreadPool
 import inspect
 import ast
 from . import astutil
@@ -7,7 +8,7 @@ import types
 
 def concWrapper(f, args, kwargs):
     result = concurrent.functions[f](*args, **kwargs)
-    operations = [inner for outer in args if type(outer) is argProxy for inner in outer.operations]
+    operations = [inner for outer in args + list(kwargs.values()) if type(outer) is argProxy for inner in outer.operations]
     return result, operations
 
 
@@ -58,6 +59,7 @@ class concurrent(object):
 
     @staticmethod
     def custom(constructor = None, apply_async = None):
+        @staticmethod
         def _custom_concurrent(*args, **kwargs):
             conc = concurrent(*args, **kwargs)
             if constructor is not None: conc.conc_constructor = constructor
@@ -66,6 +68,7 @@ class concurrent(object):
         return _custom_concurrent
 
     def __init__(self, *args, **kwargs):
+        self.in_progress = False
         self.conc_args = []
         self.conc_kwargs = {}
         if len(args) > 0 and isinstance(args[0], types.FunctionType):
@@ -81,7 +84,7 @@ class concurrent(object):
         self.concurrency = None
 
     def replaceWithProxies(self, args):
-        args_iter = args.iteritems() if type(args) is dict else enumerate(args)
+        args_iter = args.items() if type(args) is dict else enumerate(args)
         for i, arg in args_iter:
             if type(arg) is dict or type(arg) is list:
                 if not id(arg) in self.arg_proxies:
@@ -99,26 +102,38 @@ class concurrent(object):
         if len(args) > 0 and isinstance(args[0], types.FunctionType):
             self.setFunction(args[0])
             return self
+        self.in_progress = True
         if self.concurrency is None:
             self.concurrency = self.conc_constructor(*self.conc_args, **self.conc_kwargs)
         args = list(args)
         self.replaceWithProxies(args)
         self.replaceWithProxies(kwargs)
-        result = self.apply_async(self, concWrapper, [self.f_name, args, kwargs])
+        result = ConcurrentResult(self, self.apply_async(self, concWrapper, [self.f_name, args, kwargs]))
         self.results.append(result)
         return result
 
-    def process_operation_queue(self, ops):
+    def apply_operations(self, ops):
         for arg_id, key, value in ops:
             self.arg_proxies[arg_id].value.__setitem__(key, value)
 
     def wait(self):
         results = []
         while len(self.results) > 0:
-            result, operations = self.results.pop().get()
-            self.process_operation_queue(operations)
-            results.append(result)
+            results.append(self.results.pop().get())
         for assign in self.assigns:
-            assign[0][0][assign[0][1]] = assign[1].get()[0]
+            assign[0][0][assign[0][1]] = assign[1].get()
         self.arg_proxies = {}
+        self.in_progress = False
         return results
+
+concurrent.threaded = concurrent.custom(ThreadPool)
+
+class ConcurrentResult(object):
+    def __init__(self, decorator, async_result):
+        self.decorator = decorator
+        self.async_result = async_result
+
+    def get(self):
+        result, operations = self.async_result.get()
+        self.decorator.apply_operations(operations)
+        return result
